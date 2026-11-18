@@ -1,13 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// زانیارییەکانی پەیوەستبوون بە MongoDB و KD1S
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://m7eeekurd_db_user:m7em7em7e@%40%23%24@cluster0.dznvbna.mongodb.net/';
 const PROVIDER_URL = 'https://kd1s.com/api/v2';
 const API_KEY = process.env.KD1S_API_KEY || 'e2eefe68edc8ded96efce30d0196616a';
@@ -15,7 +14,7 @@ const API_KEY = process.env.KD1S_API_KEY || 'e2eefe68edc8ded96efce30d0196616a';
 const ADMIN_USER = 'm7e';
 const ADMIN_PASS = 'MM77EE@#$';
 
-let db, usersCollection, ordersCollection, settingsCollection;
+let db, usersCollection, ordersCollection, refillsCollection, settingsCollection;
 let cachedRawServices = [];
 let lastCacheTime = 0;
 
@@ -26,16 +25,19 @@ async function connectDB() {
         db = client.db('m7_store');
         usersCollection = db.collection('users');
         ordersCollection = db.collection('orders');
+        refillsCollection = db.collection('refills');
         settingsCollection = db.collection('settings');
 
-        // دروستکردنی ڕێکخستنە سەرەتاییەکان ئەگەر نەبن
         const existingConfig = await settingsCollection.findOne({ _id: 'config' });
         if (!existingConfig) {
             await settingsCollection.insertOne({
                 _id: 'config',
-                profitPercentage: 40, // ٤٠٪ قازانج
-                fib: '07500000000',
-                usdt: 'TYourAdminWalletAddressHere...'
+                profitPercentage: 40,
+                qicard: '0000000000',
+                usdt: 'TYourAdminWalletAddressHere...',
+                botToken: process.env.BOT_TOKEN || '',
+                adminChatId: process.env.ADMIN_ID || '',
+                approvalMode: 'auto' // 'auto' = جێبەجێکرنا ئۆتۆماتیک ل KD1S, 'manual' = پەسەندکرنا ئەدمینی
             });
         }
         console.log('Connected to MongoDB successfully!');
@@ -46,11 +48,34 @@ async function connectDB() {
 connectDB();
 
 async function getConfig() {
-    if (!settingsCollection) {
-        return { profitPercentage: 40, fib: '07500000000', usdt: 'TYourAdminWalletAddressHere...' };
-    }
+    const fallback = {
+        profitPercentage: 40,
+        qicard: '0000000000',
+        usdt: 'TYourAdminWalletAddressHere...',
+        botToken: process.env.BOT_TOKEN || '',
+        adminChatId: process.env.ADMIN_ID || '',
+        approvalMode: 'auto'
+    };
+    if (!settingsCollection) return fallback;
     const cfg = await settingsCollection.findOne({ _id: 'config' });
-    return cfg || { profitPercentage: 40, fib: '07500000000', usdt: 'TYourAdminWalletAddressHere...' };
+    return { ...fallback, ...(cfg || {}) };
+}
+
+async function sendTelegramMessage(chatId, text, customToken) {
+    try {
+        const cfg = await getConfig();
+        const token = (customToken || cfg.botToken || process.env.BOT_TOKEN || '').trim();
+        const target = String(chatId || '').trim();
+        if (!token || !target) return;
+
+        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+            chat_id: target,
+            text: text,
+            parse_mode: 'HTML'
+        });
+    } catch (err) {
+        console.error('Telegram Notify Error:', err.message);
+    }
 }
 
 async function fetchProviderServices() {
@@ -66,17 +91,26 @@ async function fetchProviderServices() {
     return cachedRawServices;
 }
 
-// ١. وەرگرتن یان دروستکردنی هەژماری بەکارهێنەر لە MongoDB
+// ١. وەرگرتن یان دروستکرنا حسابێ بەکارهێنەری ب Telegram ID
 app.post('/api/user', async (req, res) => {
     try {
         const telegramId = String(req.body.telegramId || '').trim();
         const username = req.body.username || 'User';
+        const firstName = req.body.firstName || username;
         if (!telegramId) return res.status(400).json({ success: false, message: 'No Telegram ID' });
 
         let user = await usersCollection.findOne({ telegramId });
         if (!user) {
-            user = { telegramId, username, balance: 0.00, createdAt: new Date() };
+            user = {
+                telegramId,
+                username,
+                firstName,
+                balance: 0.00,
+                createdAt: new Date()
+            };
             await usersCollection.insertOne(user);
+        } else if (username && user.username !== username) {
+            await usersCollection.updateOne({ telegramId }, { $set: { username, firstName } });
         }
 
         const cfg = await getConfig();
@@ -85,8 +119,9 @@ app.post('/api/user', async (req, res) => {
             balance: parseFloat(user.balance || 0),
             settings: {
                 profitPercentage: cfg.profitPercentage,
-                fib: cfg.fib,
-                usdt: cfg.usdt
+                qicard: cfg.qicard,
+                usdt: cfg.usdt,
+                approvalMode: cfg.approvalMode
             }
         });
     } catch (err) {
@@ -94,7 +129,7 @@ app.post('/api/user', async (req, res) => {
     }
 });
 
-// ٢. هێنانی هەموو خزمەتگوزارییەکانی KD1S لەگەڵ ڕێژەی قازانج
+// ٢. ئینانا هەموو خزمەتگوزاریێن KD1S
 app.get('/api/services', async (req, res) => {
     try {
         const cfg = await getConfig();
@@ -118,16 +153,16 @@ app.get('/api/services', async (req, res) => {
 
         res.json({ success: true, services: servicesWithProfit });
     } catch (error) {
-        console.error('Services Error:', error.message);
         res.status(500).json({ success: false, message: 'Server Error' });
     }
 });
 
-// ٣. تۆمارکردنی داواکاری لە KD1S و بڕینی باڵانس لە MongoDB
+// ٣. داواکرنا خزمەتگوزاریێ + ئاگەهداریا تیلیگرامی + بڕینا پارەی ل دەمێ جێبەجێکرنێ
 app.post('/api/order', async (req, res) => {
     try {
         const telegramId = String(req.body.telegramId || '').trim();
-        const serviceId = String(req.body.serviceId || req.body.service || '').trim();
+        const username = String(req.body.username || 'User').trim();
+        const serviceId = String(req.body.serviceId || '').trim();
         const link = String(req.body.link || '').trim();
         const quantity = parseInt(req.body.quantity, 10);
 
@@ -152,7 +187,44 @@ app.post('/api/order', async (req, res) => {
             return res.json({ success: false, error: 'Insufficient balance' });
         }
 
-        // ناردنی داواکاری بۆ KD1S
+        // ئەگەر سیستەم ل سەر پەسەندکرنا ئەدمینی بیت (manual)
+        if (cfg.approvalMode === 'manual') {
+            const pendingOrder = {
+                telegramId,
+                username,
+                orderId: 'PENDING-' + Math.floor(100000 + Math.random() * 900000),
+                serviceId,
+                serviceName: targetService.name,
+                link,
+                quantity,
+                cost: exactCost,
+                status: 'Pending Approval',
+                charged: false,
+                date: new Date()
+            };
+            await ordersCollection.insertOne(pendingOrder);
+
+            await sendTelegramMessage(
+                cfg.adminChatId,
+                `🔔 <b>طلب خدمة جديد (بانتظار موافقتك)</b>\n\n` +
+                `👤 المستخدم: @${username}\n` +
+                `🆔 الأيدي: <code>${telegramId}</code>\n` +
+                `📦 الخدمة: #${serviceId} - ${targetService.name}\n` +
+                `🔗 الرابط: ${link}\n` +
+                `🔢 الكمية: ${quantity}\n` +
+                `💵 التكلفة: <b>$${exactCost}</b>\n\n` +
+                `⚙️ افتح لوحة التحكم في التطبيق للموافقة وخصم الرصيد.`
+            );
+
+            return res.json({
+                success: true,
+                pending: true,
+                orderId: pendingOrder.orderId,
+                newBalance: parseFloat(user.balance)
+            });
+        }
+
+        // جێبەجێکرنا ڕاستەوخۆ ل KD1S
         const response = await axios.post(PROVIDER_URL, {
             key: API_KEY,
             action: 'add',
@@ -161,21 +233,38 @@ app.post('/api/order', async (req, res) => {
             quantity: quantity
         });
 
+        // دەمێ داواکاری دچیتە بارێ جێبەجێکرنێ دا، ئێکسەر پارە ژ حسابێ وی دهێتە بڕین
         if (response.data && response.data.order) {
             const newBalance = parseFloat((parseFloat(user.balance) - exactCost).toFixed(4));
             await usersCollection.updateOne({ telegramId }, { $set: { balance: newBalance } });
 
             const orderRecord = {
                 telegramId,
+                username,
                 orderId: response.data.order,
                 serviceId,
                 serviceName: targetService.name,
                 link,
                 quantity,
                 cost: exactCost,
+                status: 'In Progress',
+                charged: true,
                 date: new Date()
             };
             await ordersCollection.insertOne(orderRecord);
+
+            await sendTelegramMessage(
+                cfg.adminChatId,
+                `⚡ <b>طلب خدمة جديد (قيد التنفيذ)</b>\n\n` +
+                `👤 المستخدم: @${username}\n` +
+                `🆔 الأيدي: <code>${telegramId}</code>\n` +
+                `🆔 رقم الطلب: <b>#${response.data.order}</b>\n` +
+                `📦 الخدمة: ${targetService.name}\n` +
+                `🔗 الرابط: ${link}\n` +
+                `🔢 الكمية: ${quantity}\n` +
+                `💵 المبلغ المخصوم: <b>$${exactCost}</b>\n` +
+                `💰 الرصيد المتبقي: $${newBalance.toFixed(2)}`
+            );
 
             return res.json({
                 success: true,
@@ -183,18 +272,90 @@ app.post('/api/order', async (req, res) => {
                 newBalance: newBalance
             });
         } else {
+            // ئەگەر KD1S پەسەند نەکر، وەک Pending تۆمار دکەت بێی بڕینا پارەی دا ئەدمین ببینیت
+            const fallbackOrder = {
+                telegramId,
+                username,
+                orderId: 'HOLD-' + Math.floor(100000 + Math.random() * 900000),
+                serviceId,
+                serviceName: targetService.name,
+                link,
+                quantity,
+                cost: exactCost,
+                status: 'Pending Approval',
+                charged: false,
+                providerNote: (response.data && response.data.error) || 'Needs approval',
+                date: new Date()
+            };
+            await ordersCollection.insertOne(fallbackOrder);
+
+            await sendTelegramMessage(
+                cfg.adminChatId,
+                `⚠️ <b>طلب معلق يحتاج موافقتك</b>\n\n` +
+                `👤 المستخدم: @${username}\n` +
+                `🆔 الأيدي: <code>${telegramId}</code>\n` +
+                `📦 الخدمة: #${serviceId} - ${targetService.name}\n` +
+                `🔗 الرابط: ${link}\n` +
+                `🔢 الكمية: ${quantity}\n` +
+                `💵 التكلفة: $${exactCost}\n` +
+                `📝 السبب: ${fallbackOrder.providerNote}`
+            );
+
             return res.json({
-                success: false,
-                error: (response.data && response.data.error) || 'Provider rejected order'
+                success: true,
+                pending: true,
+                orderId: fallbackOrder.orderId,
+                newBalance: parseFloat(user.balance)
             });
         }
     } catch (error) {
-        console.error('Order Error:', error.message);
         res.status(500).json({ success: false, error: 'Order Failed' });
     }
 });
 
-// ٤. هێنانی تۆماری داواکارییەکانی بەکارهێنەر لە MongoDB
+// ٤. داخوازا شەحنکرنێ (QiCard یان USDT TRC20) + ئاگەهداریا ڕاستەوخۆ بۆ ئەدمینی
+app.post('/api/refill-request', async (req, res) => {
+    try {
+        const telegramId = String(req.body.telegramId || '').trim();
+        const username = String(req.body.username || 'User').trim();
+        const method = String(req.body.method || 'QiCard').trim();
+        const amount = parseFloat(req.body.amount);
+        const note = String(req.body.note || '').trim();
+
+        if (!telegramId || isNaN(amount) || amount <= 0) {
+            return res.json({ success: false, error: 'Invalid refill amount' });
+        }
+
+        const refillDoc = {
+            telegramId,
+            username,
+            method,
+            amount,
+            note,
+            status: 'Pending',
+            date: new Date()
+        };
+        await refillsCollection.insertOne(refillDoc);
+
+        const cfg = await getConfig();
+        await sendTelegramMessage(
+            cfg.adminChatId,
+            `💳 <b>طلب شحن رصيد جديد (M7 Store)</b>\n\n` +
+            `👤 المستخدم: @${username}\n` +
+            `🆔 الأيدي (اضغط للنسخ): <code>${telegramId}</code>\n` +
+            `💰 المبلغ المطلوب: <b>$${amount}</b>\n` +
+            `🏦 طريقة الدفع: <b>${method}</b>\n` +
+            (note ? `📝 ملاحظة / رقم العملية: ${note}\n` : '') +
+            `\n⚙️ لإضافة الرصيد افتح التطبيق -> Admin Panel واكتب الأيدي أعلاه.`
+        );
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, error: 'Refill request failed' });
+    }
+});
+
+// ٥. تۆمارێن داواکاریان بۆ بەکارهێنەری
 app.get('/api/orders/:telegramId', async (req, res) => {
     try {
         const telegramId = String(req.params.telegramId || '').trim();
@@ -209,16 +370,22 @@ app.get('/api/orders/:telegramId', async (req, res) => {
     }
 });
 
-// ٥. پشکنینی چوونەژوورەوەی ئەدمین
-app.post('/api/admin/login', (req, res) => {
+// ٦. چوونەژوورەوەی ئەدمین
+app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
     if (username === ADMIN_USER && password === ADMIN_PASS) {
-        return res.json({ success: true });
+        const cfg = await getConfig();
+        const pendingOrders = await ordersCollection
+            .find({ status: 'Pending Approval' })
+            .sort({ date: -1 })
+            .limit(30)
+            .toArray();
+        return res.json({ success: true, settings: cfg, pendingOrders });
     }
     res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
 
-// ٦. زیادکردنی باڵانس بۆ هەر بەکارهێنەرێک لە MongoDB لەلایەن ئەدمینەوە
+// ٧. زێدەکرنا باڵانسی ب رێکا Telegram ID ژ لایێ ئەدمینی ڤە
 app.post('/api/admin/add-balance', async (req, res) => {
     try {
         const { username, password, targetTelegramId, amount } = req.body;
@@ -247,16 +414,91 @@ app.post('/api/admin/add-balance', async (req, res) => {
             });
         }
 
+        await sendTelegramMessage(
+            targetId,
+            `✅ <b>تم شحن رصيدك بنجاح!</b>\n\n` +
+            `💰 المبلغ المضاف: <b>$${addAmt.toFixed(2)}</b>\n` +
+            `🏦 رصيدك الحالي: <b>$${updatedBalance.toFixed(2)}</b>`
+        );
+
         res.json({ success: true, newBalance: updatedBalance });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
-// ٧. گۆڕینی ڕێژەی قازانج و ژمارەکانی پارەدان لە MongoDB
+// ٨. پەسەندکرن یان ڕەتکرنا داواکاریێن هەلاویستی ژ لایێ ئەدمینی ڤە + بڕینا پارەی
+app.post('/api/admin/order-action', async (req, res) => {
+    try {
+        const { username, password, orderDbId, action } = req.body;
+        if (username !== ADMIN_USER || password !== ADMIN_PASS) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const order = await ordersCollection.findOne({ _id: new ObjectId(orderDbId) });
+        if (!order) return res.json({ success: false, message: 'Order not found' });
+
+        if (action === 'reject') {
+            await ordersCollection.updateOne(
+                { _id: order._id },
+                { $set: { status: 'Rejected' } }
+            );
+            return res.json({ success: true });
+        }
+
+        if (action === 'approve') {
+            const user = await usersCollection.findOne({ telegramId: order.telegramId });
+            if (!user || parseFloat(user.balance) < parseFloat(order.cost)) {
+                return res.json({ success: false, message: 'User balance is insufficient!' });
+            }
+
+            const providerRes = await axios.post(PROVIDER_URL, {
+                key: API_KEY,
+                action: 'add',
+                service: order.serviceId,
+                link: order.link,
+                quantity: order.quantity
+            });
+
+            if (providerRes.data && providerRes.data.order) {
+                const newBalance = parseFloat((parseFloat(user.balance) - parseFloat(order.cost)).toFixed(4));
+                await usersCollection.updateOne({ telegramId: order.telegramId }, { $set: { balance: newBalance } });
+                await ordersCollection.updateOne(
+                    { _id: order._id },
+                    {
+                        $set: {
+                            orderId: providerRes.data.order,
+                            status: 'In Progress',
+                            charged: true
+                        }
+                    }
+                );
+
+                await sendTelegramMessage(
+                    order.telegramId,
+                    `🚀 <b>تمت الموافقة على طلبك وبدأ التنفيذ!</b>\n\n` +
+                    `🆔 رقم الطلب: <b>#${providerRes.data.order}</b>\n` +
+                    `📦 الخدمة: ${order.serviceName}\n` +
+                    `💵 المبلغ المخصوم: <b>$${order.cost}</b>`
+                );
+
+                return res.json({ success: true, orderId: providerRes.data.order });
+            } else {
+                return res.json({
+                    success: false,
+                    message: (providerRes.data && providerRes.data.error) || 'KD1S rejected order'
+                });
+            }
+        }
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Action failed' });
+    }
+});
+
+// ٩. پاشەکەوتکرنا ڕێکخستنێن ئەدمینی (QiCard, USDT, قازانج, Bot Token, Admin ID)
 app.post('/api/admin/settings', async (req, res) => {
     try {
-        const { username, password, profitPercentage, fib, usdt } = req.body;
+        const { username, password, profitPercentage, qicard, usdt, botToken, adminChatId, approvalMode } = req.body;
         if (username !== ADMIN_USER || password !== ADMIN_PASS) {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
@@ -267,8 +509,11 @@ app.post('/api/admin/settings', async (req, res) => {
             {
                 $set: {
                     profitPercentage: isNaN(profitPct) ? 40 : profitPct,
-                    fib: String(fib || '').trim(),
-                    usdt: String(usdt || '').trim()
+                    qicard: String(qicard || '').trim(),
+                    usdt: String(usdt || '').trim(),
+                    botToken: String(botToken || '').trim(),
+                    adminChatId: String(adminChatId || '').trim(),
+                    approvalMode: approvalMode === 'manual' ? 'manual' : 'auto'
                 }
             },
             { upsert: true }
@@ -276,9 +521,4 @@ app.post('/api/admin/settings', async (req, res) => {
 
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('M7 Server running on port ' + PORT));
+        res.status(500).json({ success: false, message: 'Server e
